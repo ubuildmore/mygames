@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bee Garden</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+    font-family: system-ui, sans-serif; touch-action: none; user-select: none; -webkit-user-select: none; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  canvas { background: #5a9e3a; max-width: 100vw; max-height: 80vh; border: 2px solid #333; touch-action: none; }
+  p { color: #999; margin: 12px 16px; text-align: center; }
+  a { color: #8cf; }
+</style>
+</head>
+<body>
+<canvas id="c" width="900" height="560"></canvas>
+<p>Arrow keys / WASD to fly (or hold the mouse / your finger where the bee should go) · Space or tap to continue · P to pause · R to restart level<br>
+Hover over every flower until its ring fills to pollinate it. Dodge the wasps, avoid sticky spider webs, and beat the clock!<br>
+<a href="../">← all games</a></p>
+<script>
+const c = document.getElementById('c'), ctx = c.getContext('2d');
+const W = c.width, H = c.height, TOP = 44;          // HUD bar height
+const ACCEL = 900, MAX_SPEED = 250, DRAG = 3.2;      // bee flight
+const POLL_RANGE = 28, POLL_TIME = 0.55;             // seconds hovering to pollinate
+const COLORS = ['#ff6fa8', '#ff9f43', '#b98cff', '#ff5e5e', '#5ecbff', '#fff06a'];
+
+// Each level: flowers, wasps (speed), spider webs, seconds, wind (px/s² gusting sideways)
+const LEVELS = [
+  { name: 'Sunny Meadow',  flowers: 8,  wasps: 0, wspd: 0,   webs: 0, time: 60, wind: 0 },
+  { name: 'Garden Path',   flowers: 10, wasps: 1, wspd: 110, webs: 0, time: 55, wind: 0 },
+  { name: 'Wasp Patrol',   flowers: 12, wasps: 2, wspd: 125, webs: 1, time: 55, wind: 0 },
+  { name: 'Spider Corner', flowers: 14, wasps: 2, wspd: 135, webs: 3, time: 55, wind: 0 },
+  { name: 'Windy Hill',    flowers: 16, wasps: 3, wspd: 145, webs: 2, time: 60, wind: 160 },
+];
+
+const keys = {};
+let level = 0, score = 0, best = 0, lives = 3, paused = false, t = 0;
+let bee, flowers, wasps, webs, grass, particles, timeLeft, state, pointer = null, levelBonus = 0;
+
+try { best = +localStorage.getItem('beegarden-best') || 0; } catch (e) {}
+
+// ---------- sound ----------
+let audio = null;
+function beep(freq, dur = 0.08, type = 'sine', vol = 0.08) {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, audio.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+    o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime + dur);
+  } catch (e) {}
+}
+
+function rng(seed) { return () => (seed = (seed * 16807) % 2147483647) / 2147483647; }
+
+function buildLevel(i) {
+  const L = LEVELS[i], r = rng(i * 7919 + 101);
+  bee = { x: W / 2, y: H / 2 + 20, vx: 0, vy: 0, face: 1, inv: 1.5 };
+  webs = []; flowers = []; wasps = []; particles = [];
+  for (let k = 0; k < L.webs; k++) {
+    // webs hang from corners / edges
+    const spots = [[90, TOP + 70], [W - 90, TOP + 70], [W - 100, H - 90], [100, H - 90], [W / 2, TOP + 60]];
+    const [x, y] = spots[(k + i) % spots.length];
+    webs.push({ x, y, r: 75 });
+  }
+  let tries = 0;
+  while (flowers.length < L.flowers && tries++ < 5000) {
+    const x = 50 + r() * (W - 100), y = TOP + 50 + r() * (H - TOP - 90);
+    if (Math.hypot(x - bee.x, y - bee.y) < 80) continue;
+    if (flowers.some(f => Math.hypot(f.x - x, f.y - y) < 85)) continue;
+    // keep flowers partly reachable without sitting dead centre of a web
+    if (webs.some(w => Math.hypot(w.x - x, w.y - y) < w.r * 0.55)) continue;
+    flowers.push({ x, y, color: COLORS[Math.floor(r() * COLORS.length)], petals: 5 + Math.floor(r() * 3),
+      size: 14 + r() * 5, prog: 0, done: false, pop: 0, sway: r() * 6 });
+  }
+  for (let k = 0; k < L.wasps; k++) {
+    const corner = [[60, TOP + 40], [W - 60, TOP + 40], [W - 60, H - 40], [60, H - 40]][k % 4];
+    wasps.push({ x: corner[0], y: corner[1], vx: 0, vy: 0, tx: corner[0], ty: corner[1], speed: L.wspd, chase: false });
+  }
+  grass = [];
+  for (let k = 0; k < 160; k++) grass.push({ x: r() * W, y: TOP + r() * (H - TOP), h: 4 + r() * 8, s: r() });
+  timeLeft = L.time;
+}
+
+function startGame() { level = 0; score = 0; lives = 3; buildLevel(0); state = 'intro'; }
+
+// ---------- input ----------
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
+  if (k === ' ') advance();
+  if (k === 'p' && state === 'play') paused = !paused;
+  if (k === 'r' && (state === 'play' || state === 'intro')) { buildLevel(level); state = 'intro'; paused = false; }
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+function toCanvas(e) {
+  const b = c.getBoundingClientRect();
+  return { x: (e.clientX - b.left) * W / b.width, y: (e.clientY - b.top) * H / b.height };
+}
+c.addEventListener('pointerdown', e => {
+  c.setPointerCapture(e.pointerId);
+  if (state !== 'play') { advance(); return; }
+  pointer = toCanvas(e);
+});
+c.addEventListener('pointermove', e => { if (pointer) pointer = toCanvas(e); });
+const release = () => { pointer = null; };
+c.addEventListener('pointerup', release);
+c.addEventListener('pointercancel', release);
+
+function advance() {
+  if (state === 'title' || state === 'over' || state === 'won') { startGame(); return; }
+  if (state === 'intro') { state = 'play'; beep(660, 0.1); return; }
+  if (state === 'cleared') { level++; buildLevel(level); state = 'intro'; return; }
+  if (state === 'oops') { buildLevel(level); state = 'intro'; return; }
+}
+
+// ---------- update ----------
+function hurt(why) {
+  lives--;
+  beep(160, 0.35, 'sawtooth', 0.1);
+  burst(bee.x, bee.y, '#ffd23f', 18);
+  if (lives <= 0) { state = 'over'; saveBest(); return; }
+  if (why === 'time') { state = 'oops'; return; }
+  bee.inv = 2; bee.x = W / 2; bee.y = H / 2 + 20; bee.vx = bee.vy = 0;
+}
+
+function saveBest() {
+  if (score > best) { best = score; try { localStorage.setItem('beegarden-best', best); } catch (e) {} }
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 40 + Math.random() * 120;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.6 + Math.random() * 0.4, color });
+  }
+}
+
+function update(dt) {
+  t += dt;
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.96; p.vy *= 0.96; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  for (const f of flowers) f.pop = Math.max(0, f.pop - dt * 2);
+  if (state !== 'play' || paused) return;
+
+  const L = LEVELS[level];
+  timeLeft -= dt;
+  if (timeLeft <= 0) { timeLeft = 0; hurt('time'); return; }
+
+  // --- bee movement ---
+  let ax = 0, ay = 0;
+  if (keys['arrowleft'] || keys['a']) ax -= 1;
+  if (keys['arrowright'] || keys['d']) ax += 1;
+  if (keys['arrowup'] || keys['w']) ay -= 1;
+  if (keys['arrowdown'] || keys['s']) ay += 1;
+  if (pointer) {
+    const dx = pointer.x - bee.x, dy = pointer.y - bee.y, d = Math.hypot(dx, dy);
+    if (d > 6) { const k = Math.min(1, d / 60); ax = dx / d * k; ay = dy / d * k; }
+  }
+  const al = Math.hypot(ax, ay);
+  if (al > 1) { ax /= al; ay /= al; }
+  bee.vx += ax * ACCEL * dt; bee.vy += ay * ACCEL * dt;
+  if (L.wind) bee.vx += Math.sin(t * 0.7) * Math.sin(t * 0.23 + 1) * L.wind * dt;
+  const drag = webs.some(w => Math.hypot(w.x - bee.x, w.y - bee.y) < w.r) ? 14 : DRAG;
+  bee.vx -= bee.vx * drag * dt; bee.vy -= bee.vy * drag * dt;
+  const sp = Math.hypot(bee.vx, bee.vy);
+  if (sp > MAX_SPEED) { bee.vx *= MAX_SPEED / sp; bee.vy *= MAX_SPEED / sp; }
+  bee.x += bee.vx * dt; bee.y += bee.vy * dt;
+  if (bee.x < 14) { bee.x = 14; bee.vx = 0; } if (bee.x > W - 14) { bee.x = W - 14; bee.vx = 0; }
+  if (bee.y < TOP + 14) { bee.y = TOP + 14; bee.vy = 0; } if (bee.y > H - 14) { bee.y = H - 14; bee.vy = 0; }
+  if (Math.abs(bee.vx) > 10) bee.face = Math.sign(bee.vx);
+  bee.inv = Math.max(0, bee.inv - dt);
+
+  // --- pollinating ---
+  for (const f of flowers) {
+    if (f.done) continue;
+    if (Math.hypot(f.x - bee.x, f.y - bee.y) < POLL_RANGE) {
+      f.prog += dt / POLL_TIME;
+      if (f.prog >= 1) {
+        f.done = true; f.pop = 1; score += 100;
+        burst(f.x, f.y, f.color, 14); burst(f.x, f.y, '#ffe36e', 8);
+        const left = flowers.filter(g => !g.done).length;
+        beep(left ? 520 + (L.flowers - left) * 30 : 880, 0.12, 'triangle', 0.09);
+      }
+    } else f.prog = Math.max(0, f.prog - dt * 0.8);
+  }
+  if (flowers.every(f => f.done)) {
+    levelBonus = Math.ceil(timeLeft) * 10 + lives * 50;
+    score += levelBonus;
+    saveBest();
+    state = level === LEVELS.length - 1 ? 'won' : 'cleared';
+    [660, 830, 990].forEach((f, i) => setTimeout(() => beep(f, 0.15, 'triangle'), i * 120));
+    return;
+  }
+
+  // --- wasps ---
+  for (const w of wasps) {
+    const d = Math.hypot(bee.x - w.x, bee.y - w.y);
+    w.chase = d < 170 && bee.inv <= 0;
+    if (w.chase) { w.tx = bee.x; w.ty = bee.y; }
+    else if (Math.hypot(w.tx - w.x, w.ty - w.y) < 20) {
+      w.tx = 40 + Math.random() * (W - 80); w.ty = TOP + 30 + Math.random() * (H - TOP - 60);
+    }
+    const dx = w.tx - w.x, dy = w.ty - w.y, dd = Math.hypot(dx, dy) || 1;
+    const s = w.chase ? w.speed * 1.25 : w.speed * 0.7;
+    w.vx += (dx / dd * s - w.vx) * 2.5 * dt; w.vy += (dy / dd * s - w.vy) * 2.5 * dt;
+    w.x += w.vx * dt; w.y += w.vy * dt;
+    if (d < 22 && bee.inv <= 0) { hurt('sting'); if (state !== 'play') return; }
+  }
+}
+
+// ---------- drawing ----------
+function drawGround() {
+  const g = ctx.createLinearGradient(0, TOP, 0, H);
+  g.addColorStop(0, '#7cc457'); g.addColorStop(1, '#4b8f2e');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(30,80,20,0.45)'; ctx.lineWidth = 2;
+  for (const b of grass) {
+    const sw = Math.sin(t * 1.5 + b.s * 6) * 2;
+    ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.x + sw, b.y - b.h); ctx.stroke();
+  }
+}
+
+function drawWeb(w) {
+  ctx.save(); ctx.translate(w.x, w.y);
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1.2;
+  const spokes = 10;
+  for (let i = 0; i < spokes; i++) {
+    const a = i / spokes * Math.PI * 2;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * w.r, Math.sin(a) * w.r); ctx.stroke();
+  }
+  for (let ring = 1; ring <= 5; ring++) {
+    const rr = w.r * ring / 5;
+    ctx.beginPath();
+    for (let i = 0; i <= spokes; i++) {
+      const a = i / spokes * Math.PI * 2;
+      const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    }
+    ctx.stroke();
+  }
+  // spider
+  const sy = Math.sin(t * 1.3) * 8;
+  ctx.fillStyle = '#222'; ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
+  for (let i = 0; i < 4; i++) for (const s of [-1, 1]) {
+    ctx.beginPath(); ctx.moveTo(0, sy); ctx.quadraticCurveTo(s * 10, sy - 8 + i * 5, s * 14, sy - 2 + i * 5); ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(0, sy, 6, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#f33'; ctx.fillRect(-3, sy - 3, 2, 2); ctx.fillRect(1, sy - 3, 2, 2);
+  ctx.restore();
+}
+
+function drawFlower(f) {
+  const sway = Math.sin(t * 1.2 + f.sway) * 0.08;
+  const scale = (f.done ? 1.15 : 0.85) + f.pop * 0.35;
+  ctx.save(); ctx.translate(f.x, f.y);
+  // stem + leaf
+  ctx.strokeStyle = '#2f6b1f'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(3, 18, 0, 32); ctx.stroke();
+  ctx.fillStyle = '#3d8a28';
+  ctx.beginPath(); ctx.ellipse(6, 22, 7, 3, -0.5, 0, Math.PI * 2); ctx.fill();
+  ctx.rotate(sway); ctx.scale(scale, scale);
+  // petals
+  ctx.fillStyle = f.done ? f.color : shade(f.color);
+  for (let i = 0; i < f.petals; i++) {
+    const a = i / f.petals * Math.PI * 2 + (f.done ? t * 0.3 : 0);
+    ctx.beginPath();
+    ctx.ellipse(Math.cos(a) * f.size * 0.7, Math.sin(a) * f.size * 0.7, f.size * 0.6, f.size * 0.36, a, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = f.done ? '#ffd23f' : '#9a7b3a';
+  ctx.beginPath(); ctx.arc(0, 0, f.size * 0.42, 0, Math.PI * 2); ctx.fill();
+  if (f.done) {   // happy face
+    ctx.fillStyle = '#5a3a0a';
+    ctx.fillRect(-3.5, -2.5, 2, 2); ctx.fillRect(1.5, -2.5, 2, 2);
+    ctx.strokeStyle = '#5a3a0a'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(0, 0.5, 3, 0.2, Math.PI - 0.2); ctx.stroke();
+  }
+  ctx.restore();
+  // progress ring
+  if (!f.done && f.prog > 0) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(f.x, f.y, f.size + 12, -Math.PI / 2, -Math.PI / 2 + f.prog * Math.PI * 2); ctx.stroke();
+  }
+  if (f.done) {   // sparkle
+    const a = t * 2 + f.sway;
+    ctx.fillStyle = 'rgba(255,255,200,0.8)';
+    ctx.beginPath(); ctx.arc(f.x + Math.cos(a) * (f.size + 6), f.y + Math.sin(a) * (f.size + 6), 1.8, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function shade(hex) {   // faded petal colour for un-pollinated flowers
+  const n = parseInt(hex.slice(1), 16), r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const m = (v) => Math.round(v * 0.55 + 140 * 0.45);
+  return `rgb(${m(r)},${m(g)},${m(b)})`;
+}
+
+function drawBee() {
+  if (bee.inv > 0 && Math.floor(t * 12) % 2 && state === 'play') return;
+  ctx.save(); ctx.translate(bee.x, bee.y + Math.sin(t * 6) * 2);
+  ctx.scale(bee.face, 1); ctx.rotate(Math.max(-0.4, Math.min(0.4, bee.vy / 600)));
+  // wings
+  const flap = Math.sin(t * 50) * 0.5 + 0.5;
+  ctx.fillStyle = 'rgba(220,240,255,0.75)'; ctx.strokeStyle = 'rgba(120,150,180,0.8)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.ellipse(-3, -12, 7, 10 * (0.4 + flap * 0.6), -0.4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(4, -11, 6, 8 * (0.4 + flap * 0.6), 0.3, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  // stinger
+  ctx.fillStyle = '#222';
+  ctx.beginPath(); ctx.moveTo(-15, 0); ctx.lineTo(-21, 1); ctx.lineTo(-15, 3); ctx.fill();
+  // body
+  ctx.fillStyle = '#ffcc1a';
+  ctx.beginPath(); ctx.ellipse(0, 1, 15, 10, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.save(); ctx.clip();
+  ctx.fillStyle = '#222';
+  ctx.fillRect(-9, -10, 5, 22); ctx.fillRect(0, -10, 5, 22);
+  ctx.restore();
+  // head
+  ctx.fillStyle = '#222';
+  ctx.beginPath(); ctx.arc(14, 0, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(16, -2, 2.4, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(16.8, -2, 1.2, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(15, -6); ctx.quadraticCurveTo(18, -14, 22, -13); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(12, -6); ctx.quadraticCurveTo(13, -15, 17, -16); ctx.stroke();
+  ctx.restore();
+}
+
+function drawWasp(w) {
+  const face = w.vx >= 0 ? 1 : -1;
+  ctx.save(); ctx.translate(w.x, w.y); ctx.scale(face, 1);
+  const flap = Math.sin(t * 60) * 0.5 + 0.5;
+  ctx.fillStyle = 'rgba(230,230,230,0.6)';
+  ctx.beginPath(); ctx.ellipse(-2, -10, 6, 9 * (0.4 + flap * 0.6), -0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.moveTo(-14, 0); ctx.lineTo(-22, 2); ctx.lineTo(-14, 4); ctx.fill();
+  // abdomen (thin waist)
+  ctx.fillStyle = '#f2d200';
+  ctx.beginPath(); ctx.ellipse(-6, 2, 9, 6, 0.15, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#111'; ctx.fillRect(-10, -3, 2.5, 10); ctx.fillRect(-5, -4, 2.5, 11);
+  ctx.fillStyle = '#f2d200';
+  ctx.beginPath(); ctx.ellipse(5, -1, 5, 4, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(12, -2, 4.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = w.chase ? '#f22' : '#c44';
+  ctx.beginPath(); ctx.arc(13.5, -3, 1.8, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5;   // angry brow
+  ctx.beginPath(); ctx.moveTo(10, -7); ctx.lineTo(16, -5); ctx.stroke();
+  ctx.restore();
+  if (w.chase) { ctx.fillStyle = '#f33'; ctx.font = 'bold 16px system-ui'; ctx.textAlign = 'center'; ctx.fillText('!', w.x, w.y - 20); }
+}
+
+function drawHUD() {
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, TOP);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 18px system-ui'; ctx.textBaseline = 'middle';
+  const done = flowers.filter(f => f.done).length;
+  ctx.textAlign = 'left';
+  ctx.fillText(`Level ${level + 1}: ${LEVELS[level].name}`, 14, TOP / 2);
+  ctx.textAlign = 'center';
+  ctx.fillText(`🌼 ${done} / ${flowers.length}`, W / 2 - 70, TOP / 2);
+  ctx.fillStyle = timeLeft < 10 ? '#ff6b6b' : '#fff';
+  ctx.fillText(`⏱ ${Math.ceil(timeLeft)}`, W / 2 + 40, TOP / 2);
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'right';
+  ctx.fillText(`${'🐝'.repeat(Math.max(0, lives))}   Score ${score}   Best ${best}`, W - 14, TOP / 2);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function panel(title, lines) {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.fillStyle = '#ffd23f'; ctx.font = 'bold 44px system-ui';
+  ctx.fillText(title, W / 2, H / 2 - 50);
+  ctx.fillStyle = '#fff'; ctx.font = '20px system-ui';
+  lines.forEach((l, i) => ctx.fillText(l, W / 2, H / 2 + i * 30));
+}
+
+function draw() {
+  drawGround();
+  for (const w of webs) drawWeb(w);
+  for (const f of flowers) drawFlower(f);
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const w of wasps) drawWasp(w);
+  drawBee();
+  drawHUD();
+  const L = LEVELS[level];
+  if (state === 'title') panel('🐝 Bee Garden', ['Pollinate every flower in the garden!', 'Hover over a flower until its ring fills up.', '', 'Press Space or tap to start']);
+  else if (state === 'intro') {
+    const extra = [];
+    if (L.wasps) extra.push(`${L.wasps} wasp${L.wasps > 1 ? 's' : ''} on patrol: don't get stung!`);
+    if (L.webs) extra.push('Spider webs slow you down.');
+    if (L.wind) extra.push('Watch out for gusts of wind!');
+    panel(`Level ${level + 1}: ${L.name}`, [`Pollinate ${L.flowers} flowers in ${L.time} seconds.`, ...extra, '', 'Press Space or tap to fly']);
+  }
+  else if (state === 'cleared') panel('Garden in bloom! 🌸', [`Bonus: +${levelBonus} (time left + lives)`, `Score: ${score}`, '', 'Press Space or tap for the next garden']);
+  else if (state === 'oops') panel("Time's up!", ['The flowers wilted before you got to them all.', `Lives left: ${lives}`, '', 'Press Space or tap to try again']);
+  else if (state === 'over') panel('Game Over', [`Final score: ${score}   Best: ${best}`, '', 'Press Space or tap to play again']);
+  else if (state === 'won') panel('🏆 Queen Bee! 🏆', ['You pollinated every garden!', `Final score: ${score}   Best: ${best}`, '', 'Press Space or tap to play again']);
+  else if (paused) panel('Paused', ['Press P to resume']);
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+buildLevel(0); state = 'title';
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
