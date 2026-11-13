@@ -15,15 +15,18 @@
 </head>
 <body>
 <canvas id="c" width="900" height="560"></canvas>
-<p>Arrow keys / WASD to fly (or hold the mouse / your finger where the bee should go) · Space or tap to continue · P to pause · R to restart level<br>
-Hover over every flower until its ring fills to pollinate it. Dodge the wasps, avoid sticky spider webs, and beat the clock!<br>
+<p>Arrow keys / WASD to fly (or hold the mouse / your finger where the bee should go) · Space / X to sting (or the STING button on touch screens) · P to pause · R to restart level<br>
+Hover over every flower until its ring fills to pollinate it. Sting wasps twice to chase them off for good, avoid sticky spider webs, and beat the clock!<br>
 <a href="../">← all games</a></p>
 <script>
 const c = document.getElementById('c'), ctx = c.getContext('2d');
 const W = c.width, H = c.height, TOP = 44;          // HUD bar height
 const ACCEL = 900, MAX_SPEED = 250, DRAG = 3.2;      // bee flight
 const POLL_RANGE = 28, POLL_TIME = 0.55;             // seconds hovering to pollinate
-const COLORS = ['#ff6fa8', '#ff9f43', '#b98cff', '#ff5e5e', '#5ecbff', '#fff06a'];
+const STING_TIME = 0.22, STING_CD = 0.9;             // seconds the sting is active / recharge time
+const STING_RANGE = 42, STING_DASH = 430, AIM_RANGE = 150, WASP_HP = 2, STUN_TIME = 2.5;
+const BTN = { x: W - 58, y: H - 58, r: 38 };        // on-screen sting button (touch screens)
+const COLORS =['#ff6fa8', '#ff9f43', '#b98cff', '#ff5e5e', '#5ecbff', '#fff06a'];
 
 // Each level: flowers, wasps (speed), spider webs, seconds, wind (px/s² gusting sideways)
 const LEVELS = [
@@ -37,6 +40,7 @@ const LEVELS = [
 const keys = {};
 let level = 0, score = 0, best = 0, lives = 3, paused = false, t = 0;
 let bee, flowers, wasps, webs, grass, particles, timeLeft, state, pointer = null, levelBonus = 0;
+let steerId = null, stingCount = 0, touchUI = matchMedia('(pointer: coarse)').matches;
 
 try { best = +localStorage.getItem('beegarden-best') || 0; } catch (e) {}
 
@@ -57,7 +61,7 @@ function rng(seed) { return () => (seed = (seed * 16807) % 2147483647) / 2147483
 
 function buildLevel(i) {
   const L = LEVELS[i], r = rng(i * 7919 + 101);
-  bee = { x: W / 2, y: H / 2 + 20, vx: 0, vy: 0, face: 1, inv: 1.5 };
+  bee = { x: W / 2, y: H / 2 + 20, vx: 0, vy: 0, face: 1, inv: 1.5, sting: 0, cd: 0, stingId: 0 };
   webs = []; flowers = []; wasps = []; particles = [];
   for (let k = 0; k < L.webs; k++) {
     // webs hang from corners / edges
@@ -77,7 +81,8 @@ function buildLevel(i) {
   }
   for (let k = 0; k < L.wasps; k++) {
     const corner = [[60, TOP + 40], [W - 60, TOP + 40], [W - 60, H - 40], [60, H - 40]][k % 4];
-    wasps.push({ x: corner[0], y: corner[1], vx: 0, vy: 0, tx: corner[0], ty: corner[1], speed: L.wspd, chase: false });
+    wasps.push({ x: corner[0], y: corner[1], vx: 0, vy: 0, tx: corner[0], ty: corner[1], speed: L.wspd, chase: false,
+      hp: WASP_HP, stun: 0, hitBy: -1, dead: false });
   }
   grass = [];
   for (let k = 0; k < 160; k++) grass.push({ x: r() * W, y: TOP + r() * (H - TOP), h: 4 + r() * 8, s: r() });
@@ -91,7 +96,8 @@ addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   keys[k] = true;
   if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
-  if (k === ' ') advance();
+  if ((k === ' ' || k === 'x') && state === 'play') { if (!e.repeat) sting(); }
+  else if (k === ' ') advance();
   if (k === 'p' && state === 'play') paused = !paused;
   if (k === 'r' && (state === 'play' || state === 'intro')) { buildLevel(level); state = 'intro'; paused = false; }
 });
@@ -103,11 +109,14 @@ function toCanvas(e) {
 }
 c.addEventListener('pointerdown', e => {
   c.setPointerCapture(e.pointerId);
+  if (e.pointerType === 'touch') touchUI = true;
   if (state !== 'play') { advance(); return; }
-  pointer = toCanvas(e);
+  const p = toCanvas(e);
+  if (touchUI && Math.hypot(p.x - BTN.x, p.y - BTN.y) < BTN.r + 12) { sting(); return; }
+  pointer = p; steerId = e.pointerId;
 });
-c.addEventListener('pointermove', e => { if (pointer) pointer = toCanvas(e); });
-const release = () => { pointer = null; };
+c.addEventListener('pointermove', e => { if (e.pointerId === steerId) pointer = toCanvas(e); });
+const release = e => { if (e.pointerId === steerId) { pointer = null; steerId = null; } };
 c.addEventListener('pointerup', release);
 c.addEventListener('pointercancel', release);
 
@@ -119,6 +128,42 @@ function advance() {
 }
 
 // ---------- update ----------
+// Sting: a quick dash (aimed at the nearest wasp if one is close) that hurts any wasp it touches.
+function sting() {
+  if (state !== 'play' || paused || bee.cd > 0) return;
+  let tx = null, ty = null, nd = AIM_RANGE;
+  for (const w of wasps) {
+    const d = Math.hypot(w.x - bee.x, w.y - bee.y);
+    if (d < nd) { nd = d; tx = w.x; ty = w.y; }
+  }
+  let dx, dy;
+  if (tx !== null) { dx = (tx - bee.x) / (nd || 1); dy = (ty - bee.y) / (nd || 1); }
+  else {
+    const sp = Math.hypot(bee.vx, bee.vy);
+    if (sp > 30) { dx = bee.vx / sp; dy = bee.vy / sp; } else { dx = bee.face; dy = 0; }
+  }
+  bee.vx = dx * STING_DASH; bee.vy = dy * STING_DASH;
+  bee.sting = STING_TIME; bee.cd = STING_CD; bee.stingId = ++stingCount;
+  beep(950, 0.07, 'square', 0.05);
+}
+
+function hitWasp(w, d) {
+  w.hitBy = bee.stingId;
+  w.hp--;
+  const kx = (w.x - bee.x) / (d || 1), ky = (w.y - bee.y) / (d || 1);
+  if (w.hp <= 0) {
+    w.dead = true; score += 250;
+    burst(w.x, w.y, '#f2d200', 16); burst(w.x, w.y, '#222', 10);
+    [520, 700, 900].forEach((f, i) => setTimeout(() => beep(f, 0.1, 'square', 0.06), i * 70));
+  } else {
+    w.stun = STUN_TIME; w.vx = kx * 380; w.vy = ky * 380; score += 50;
+    w.speed *= 1.15;                        // it comes back angrier
+    burst(w.x, w.y, '#fff', 10);
+    beep(320, 0.15, 'square', 0.07);
+  }
+  bee.vx *= -0.35; bee.vy *= -0.35;         // bounce off
+}
+
 function hurt(why) {
   lives--;
   beep(160, 0.35, 'sawtooth', 0.1);
@@ -167,12 +212,15 @@ function update(dt) {
   const drag = webs.some(w => Math.hypot(w.x - bee.x, w.y - bee.y) < w.r) ? 14 : DRAG;
   bee.vx -= bee.vx * drag * dt; bee.vy -= bee.vy * drag * dt;
   const sp = Math.hypot(bee.vx, bee.vy);
-  if (sp > MAX_SPEED) { bee.vx *= MAX_SPEED / sp; bee.vy *= MAX_SPEED / sp; }
+  const maxSp = bee.sting > 0 ? STING_DASH : MAX_SPEED;
+  if (sp > maxSp) { bee.vx *= maxSp / sp; bee.vy *= maxSp / sp; }
   bee.x += bee.vx * dt; bee.y += bee.vy * dt;
   if (bee.x < 14) { bee.x = 14; bee.vx = 0; } if (bee.x > W - 14) { bee.x = W - 14; bee.vx = 0; }
   if (bee.y < TOP + 14) { bee.y = TOP + 14; bee.vy = 0; } if (bee.y > H - 14) { bee.y = H - 14; bee.vy = 0; }
   if (Math.abs(bee.vx) > 10) bee.face = Math.sign(bee.vx);
   bee.inv = Math.max(0, bee.inv - dt);
+  bee.sting = Math.max(0, bee.sting - dt);
+  bee.cd = Math.max(0, bee.cd - dt);
 
   // --- pollinating ---
   for (const f of flowers) {
@@ -199,6 +247,14 @@ function update(dt) {
   // --- wasps ---
   for (const w of wasps) {
     const d = Math.hypot(bee.x - w.x, bee.y - w.y);
+    if (bee.sting > 0 && d < STING_RANGE && w.hitBy !== bee.stingId) { hitWasp(w, d); continue; }
+    if (w.stun > 0) {   // dazed: drift, can't sting
+      w.stun -= dt; w.chase = false;
+      w.vx -= w.vx * 3 * dt; w.vy -= w.vy * 3 * dt;
+      w.x = Math.max(20, Math.min(W - 20, w.x + w.vx * dt));
+      w.y = Math.max(TOP + 20, Math.min(H - 20, w.y + w.vy * dt));
+      continue;
+    }
     w.chase = d < 170 && bee.inv <= 0;
     if (w.chase) { w.tx = bee.x; w.ty = bee.y; }
     else if (Math.hypot(w.tx - w.x, w.ty - w.y) < 20) {
@@ -208,8 +264,9 @@ function update(dt) {
     const s = w.chase ? w.speed * 1.25 : w.speed * 0.7;
     w.vx += (dx / dd * s - w.vx) * 2.5 * dt; w.vy += (dy / dd * s - w.vy) * 2.5 * dt;
     w.x += w.vx * dt; w.y += w.vy * dt;
-    if (d < 22 && bee.inv <= 0) { hurt('sting'); if (state !== 'play') return; }
+    if (d < 22 && bee.inv <= 0 && bee.sting <= 0) { hurt('sting'); if (state !== 'play') return; }
   }
+  wasps = wasps.filter(w => !w.dead);
 }
 
 // ---------- drawing ----------
@@ -307,9 +364,10 @@ function drawBee() {
   ctx.fillStyle = 'rgba(220,240,255,0.75)'; ctx.strokeStyle = 'rgba(120,150,180,0.8)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.ellipse(-3, -12, 7, 10 * (0.4 + flap * 0.6), -0.4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
   ctx.beginPath(); ctx.ellipse(4, -11, 6, 8 * (0.4 + flap * 0.6), 0.3, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-  // stinger
-  ctx.fillStyle = '#222';
-  ctx.beginPath(); ctx.moveTo(-15, 0); ctx.lineTo(-21, 1); ctx.lineTo(-15, 3); ctx.fill();
+  // stinger (extends while stinging)
+  const sl = bee.sting > 0 ? 12 : 0;
+  ctx.fillStyle = bee.sting > 0 ? '#c00' : '#222';
+  ctx.beginPath(); ctx.moveTo(-15, 0); ctx.lineTo(-21 - sl, 1); ctx.lineTo(-15, 3); ctx.fill();
   // body
   ctx.fillStyle = '#ffcc1a';
   ctx.beginPath(); ctx.ellipse(0, 1, 15, 10, 0, 0, Math.PI * 2); ctx.fill();
@@ -326,11 +384,40 @@ function drawBee() {
   ctx.beginPath(); ctx.moveTo(15, -6); ctx.quadraticCurveTo(18, -14, 22, -13); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(12, -6); ctx.quadraticCurveTo(13, -15, 17, -16); ctx.stroke();
   ctx.restore();
+  if (bee.sting > 0) {   // sting swoosh
+    ctx.strokeStyle = `rgba(255,255,255,${bee.sting / STING_TIME})`; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(bee.x, bee.y, STING_RANGE * (1.2 - 0.4 * bee.sting / STING_TIME), 0, Math.PI * 2); ctx.stroke();
+  } else if (bee.cd > 0 && state === 'play') {   // recharge arc
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(bee.x, bee.y, 26, -Math.PI / 2, -Math.PI / 2 + (1 - bee.cd / STING_CD) * Math.PI * 2); ctx.stroke();
+  }
+}
+
+function drawStingButton() {
+  const ready = bee.cd <= 0;
+  ctx.fillStyle = ready ? 'rgba(200,30,30,0.55)' : 'rgba(80,80,80,0.45)';
+  ctx.beginPath(); ctx.arc(BTN.x, BTN.y, BTN.r, 0, Math.PI * 2); ctx.fill();
+  if (!ready) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(BTN.x, BTN.y, BTN.r - 3, -Math.PI / 2, -Math.PI / 2 + (1 - bee.cd / STING_CD) * Math.PI * 2); ctx.stroke();
+  }
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 15px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('STING', BTN.x, BTN.y);
+  ctx.textBaseline = 'alphabetic';
 }
 
 function drawWasp(w) {
   const face = w.vx >= 0 ? 1 : -1;
+  if (w.stun > 0) {   // dizzy stars
+    for (let i = 0; i < 3; i++) {
+      const a = t * 5 + i * 2.1;
+      ctx.fillStyle = '#fff6a0';
+      ctx.font = '12px system-ui'; ctx.textAlign = 'center';
+      ctx.fillText('★', w.x + Math.cos(a) * 14, w.y - 18 + Math.sin(a) * 4);
+    }
+  }
   ctx.save(); ctx.translate(w.x, w.y); ctx.scale(face, 1);
+  if (w.stun > 0) ctx.rotate(Math.sin(t * 9) * 0.5);
   const flap = Math.sin(t * 60) * 0.5 + 0.5;
   ctx.fillStyle = 'rgba(230,230,230,0.6)';
   ctx.beginPath(); ctx.ellipse(-2, -10, 6, 9 * (0.4 + flap * 0.6), -0.3, 0, Math.PI * 2); ctx.fill();
@@ -385,12 +472,13 @@ function draw() {
   ctx.globalAlpha = 1;
   for (const w of wasps) drawWasp(w);
   drawBee();
+  if (touchUI && state === 'play') drawStingButton();
   drawHUD();
   const L = LEVELS[level];
-  if (state === 'title') panel('🐝 Bee Garden', ['Pollinate every flower in the garden!', 'Hover over a flower until its ring fills up.', '', 'Press Space or tap to start']);
+  if (state === 'title') panel('🐝 Bee Garden', ['Pollinate every flower in the garden!', 'Hover over a flower until its ring fills up.', 'Press Space / X (or the STING button) to sting wasps.', '','Press Space or tap to start']);
   else if (state === 'intro') {
     const extra = [];
-    if (L.wasps) extra.push(`${L.wasps} wasp${L.wasps > 1 ? 's' : ''} on patrol: don't get stung!`);
+    if (L.wasps) extra.push(`${L.wasps} wasp${L.wasps > 1 ? 's' : ''} on patrol: sting them twice to drive them off (+250)!`);
     if (L.webs) extra.push('Spider webs slow you down.');
     if (L.wind) extra.push('Watch out for gusts of wind!');
     panel(`Level ${level + 1}: ${L.name}`, [`Pollinate ${L.flowers} flowers in ${L.time} seconds.`, ...extra, '', 'Press Space or tap to fly']);
