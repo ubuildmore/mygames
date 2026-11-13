@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quick Draw</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+    font-family: system-ui, sans-serif; touch-action: none; user-select: none; -webkit-user-select: none; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  canvas { background: #000; max-width: 100vw; max-height: 80vh; border: 2px solid #333; touch-action: none; }
+  canvas.aim { cursor: none; }
+  p { color: #999; margin: 12px 16px; text-align: center; }
+  a { color: #8cf; }
+</style>
+</head>
+<body>
+<canvas id="c" width="900" height="560"></canvas>
+<p>Click / tap to shoot · R, Space or right-click to reload (or tap the bullets box) · P to pause<br>
+Shoot the masked bandits before they shoot you. Don't hit the townsfolk or the deputy!<br>
+<a href="../">← all games</a></p>
+<script>
+const c = document.getElementById('c'), ctx = c.getContext('2d');
+const W = c.width, H = c.height, TOP = 40, STREET = 450;
+const MAX_AMMO = 6, RELOAD_TIME = 0.7, HIDE_DIST = 92;
+const AMMO_BOX = { x: W - 176, y: H - 50, w: 166, h: 42 };
+
+// Each round: bandits to take down, how many people can be up at once,
+// seconds a bandit waits before firing, chance a popper is a townsperson, gap between pop-ups
+const ROUNDS = [
+  { name: 'Quiet Morning',      quota: 8,  maxUp: 1, stay: 2.2, innocent: 0.2,  gap: [0.6, 1.2] },
+  { name: 'High Noon',          quota: 10, maxUp: 2, stay: 1.9, innocent: 0.25, gap: [0.5, 1.0] },
+  { name: 'The Bank Job',       quota: 12, maxUp: 2, stay: 1.6, innocent: 0.3,  gap: [0.4, 0.9] },
+  { name: 'Saloon Brawl',       quota: 14, maxUp: 3, stay: 1.4, innocent: 0.35, gap: [0.35, 0.8] },
+  { name: 'Showdown at Sunset', quota: 16, maxUp: 3, stay: 1.2, innocent: 0.4,  gap: [0.3, 0.7] },
+];
+const TOWNSFOLK = ['lady', 'farmer', 'kid', 'oldtimer', 'deputy'];
+
+const BUILDINGS = [
+  { x: 30,  w: 270, name: 'SALOON', color: '#a0522d' },
+  { x: 315, w: 270, name: 'BANK',   color: '#8a6d4b' },
+  { x: 600, w: 270, name: 'HOTEL',  color: '#9c5a3c' },
+];
+// Pop-up spots: upper windows (clipped to the window) and street cover (barrel, trough, crate)
+const SPOTS = [];
+for (const b of BUILDINGS) for (const dx of [72, b.w - 72])
+  SPOTS.push({ x: b.x + dx, base: 222, clipTop: 128, clipW: 84, cover: 'window' });
+[[165, 'barrel'], [450, 'trough'], [665, 'crate']].forEach(([x, cover]) =>
+  SPOTS.push({ x, base: 490, clipTop: 390, clipW: 96, cover }));
+
+let state = 'title', round = 0, score = 0, best = 0, lives = 3, paused = false, t = 0;
+let people, particles, popups, holes, ammo, reloading, spawnT, downed, shots, hits, combo, shake, flash, roundBonus;
+let mouse = { x: W / 2, y: H / 2, on: false };
+
+try { best = +localStorage.getItem('quickdraw-best') || 0; } catch (e) {}
+
+// ---------- sound ----------
+let audio = null;
+function ac() { return audio = audio || new (window.AudioContext || window.webkitAudioContext)(); }
+function beep(freq, dur = 0.08, type = 'sine', vol = 0.08) {
+  try {
+    const a = ac(), o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  } catch (e) {}
+}
+function bang(vol = 0.3, len = 0.25, cutoff = 1800) {
+  try {
+    const a = ac(), n = Math.floor(a.sampleRate * len), buf = a.createBuffer(1, n, a.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 3);
+    const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+    s.buffer = buf; f.type = 'lowpass'; f.frequency.value = cutoff; g.gain.value = vol;
+    s.connect(f).connect(g).connect(a.destination); s.start();
+  } catch (e) {}
+}
+
+// ---------- game flow ----------
+function startRound(i) {
+  round = i; people = []; particles = []; popups = []; holes = [];
+  ammo = MAX_AMMO; reloading = 0; spawnT = 1; downed = 0; shots = 0; hits = 0; combo = 1; shake = 0; flash = 0;
+  state = 'intro';
+}
+function startGame() { score = 0; lives = 3; startRound(0); }
+function advance() {
+  if (state === 'title' || state === 'over' || state === 'won') { startGame(); return; }
+  if (state === 'intro') { state = 'play'; beep(520, 0.1, 'triangle'); return; }
+  if (state === 'cleared') { startRound(round + 1); return; }
+}
+function saveBest() {
+  if (score > best) { best = score; try { localStorage.setItem('quickdraw-best', best); } catch (e) {} }
+}
+
+// ---------- input ----------
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === ' ' || k.startsWith('arrow')) e.preventDefault();
+  if (k === 'p' && state === 'play') paused = !paused;
+  else if ((k === 'r' || k === ' ') && state === 'play') reload();
+  else if (k === ' ' || k === 'enter') advance();
+});
+function toCanvas(e) {
+  const b = c.getBoundingClientRect();
+  return { x: (e.clientX - b.left) * W / b.width, y: (e.clientY - b.top) * H / b.height };
+}
+c.addEventListener('contextmenu', e => e.preventDefault());
+c.addEventListener('pointermove', e => { Object.assign(mouse, toCanvas(e)); mouse.on = e.pointerType === 'mouse'; });
+c.addEventListener('pointerleave', () => { mouse.on = false; });
+c.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const p = toCanvas(e);
+  Object.assign(mouse, p); mouse.on = e.pointerType === 'mouse';
+  if (state !== 'play') { advance(); return; }
+  if (paused) return;
+  const inBox = p.x > AMMO_BOX.x && p.x < AMMO_BOX.x + AMMO_BOX.w && p.y > AMMO_BOX.y && p.y < AMMO_BOX.y + AMMO_BOX.h;
+  if (e.button === 2 || inBox) reload(); else shoot(p.x, p.y);
+});
+
+function reload() {
+  if (state !== 'play' || paused || reloading > 0 || ammo === MAX_AMMO) return;
+  reloading = RELOAD_TIME;
+  beep(1400, 0.03, 'square', 0.04); setTimeout(() => beep(1100, 0.03, 'square', 0.04), 250);
+}
+
+// Where a person's torso bottom is drawn right now.
+function bodyY(p) { return SPOTS[p.spot].base + (1 - p.up) * HIDE_DIST; }
+
+function hitTest(p, x, y) {
+  if (!['rise', 'up', 'fire'].includes(p.state) || p.up < 0.35) return false;
+  const s = SPOTS[p.spot], by = bodyY(p), sc = p.kind === 'kid' ? 0.85 : 1;
+  if (x < s.x - s.clipW / 2 || x > s.x + s.clipW / 2 || y < s.clipTop || y > s.base) return false;
+  return x > s.x - 20 * sc && x < s.x + 20 * sc && y > by - 80 * sc && y < by;
+}
+
+function shoot(x, y) {
+  if (reloading > 0) return;
+  if (ammo <= 0) { beep(300, 0.04, 'square', 0.05); popups.push({ x: AMMO_BOX.x + 80, y: AMMO_BOX.y - 10, text: 'RELOAD!', color: '#ffd23f', life: 0.8 }); return; }
+  ammo--; shots++;
+  bang();
+  puff(x, y, '#ddd', 5);
+  for (let i = people.length - 1; i >= 0; i--) {
+    const p = people[i];
+    if (!hitTest(p, x, y)) continue;
+    knockDown(p, x);
+    if (p.kind === 'bandit') {
+      hits++; downed++;
+      const quick = p.state === 'up' ? Math.max(0, Math.round((1 - p.t / ROUNDS[round].stay) * 100)) : 100;
+      const pts = (100 + quick) * combo;
+      score += pts;
+      popups.push({ x: SPOTS[p.spot].x, y: bodyY(p) - 95, text: `+${pts}${combo > 1 ? ` x${combo}` : ''}`, color: '#ffe36e', life: 1 });
+      combo = Math.min(5, combo + 1);
+      beep(220, 0.12, 'triangle', 0.08);
+    } else {
+      score = Math.max(0, score - 200); combo = 1;
+      popups.push({ x: SPOTS[p.spot].x, y: bodyY(p) - 95, text: p.kind === 'deputy' ? 'Not the deputy!' : 'Oops! -200', color: '#ff7b7b', life: 1.3 });
+      beep(150, 0.4, 'sawtooth', 0.08);
+      loseLife();
+    }
+    return;
+  }
+  combo = 1;
+  if (y > TOP && y < STREET) holes.push({ x, y, life: 4 });
+}
+
+function knockDown(p, x) {
+  p.state = 'down'; p.t = 0; p.dir = x < SPOTS[p.spot].x ? 1 : -1;
+  const by = bodyY(p);
+  particles.push({ x: SPOTS[p.spot].x, y: by - 70, vx: -p.dir * 60, vy: -260, spin: p.dir * 8, a: 0, life: 1.4, hat: p.kind });
+  puff(SPOTS[p.spot].x, by - 40, p.kind === 'bandit' ? '#c9a46a' : '#fff', 8);
+}
+
+function loseLife() {
+  lives--; shake = 0.35; flash = 0.35;
+  if (lives <= 0) { lives = 0; state = 'over'; saveBest(); }
+}
+
+function puff(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 20 + Math.random() * 70;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 20, life: 0.4 + Math.random() * 0.4, color, r: 2 + Math.random() * 3 });
+  }
+}
+
+function spawn() {
+  const R = ROUNDS[round];
+  const active = people.filter(p => p.state !== 'down');
+  if (active.length >= R.maxUp) return false;
+  const free = SPOTS.map((_, i) => i).filter(i => !people.some(p => p.spot === i));
+  if (!free.length) return false;
+  const spot = free[Math.floor(Math.random() * free.length)];
+  const kind = Math.random() < R.innocent ? TOWNSFOLK[Math.floor(Math.random() * TOWNSFOLK.length)] : 'bandit';
+  people.push({ spot, kind, state: 'rise', t: 0, up: 0, tilt: 0, dir: 1,
+    stay: R.stay * (0.85 + Math.random() * 0.3) });
+  return true;
+}
+
+// ---------- update ----------
+function update(dt) {
+  t += dt;
+  for (const p of particles) {
+    p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    if (p.hat) { p.vy += 700 * dt; p.a += p.spin * dt; } else { p.vx *= 0.94; p.vy *= 0.94; }
+  }
+  particles = particles.filter(p => p.life > 0);
+  for (const p of popups) { p.y -= 40 * dt; p.life -= dt; }
+  popups = popups.filter(p => p.life > 0);
+  for (const h of holes) h.life -= dt;
+  holes = holes.filter(h => h.life > 0);
+  shake = Math.max(0, shake - dt); flash = Math.max(0, flash - dt);
+  if (state !== 'play' || paused) return;
+
+  const R = ROUNDS[round];
+  if (reloading > 0) { reloading -= dt; if (reloading <= 0) { reloading = 0; ammo = MAX_AMMO; beep(900, 0.05, 'square', 0.05); } }
+
+  if (downed < R.quota) {
+    spawnT -= dt;
+    if (spawnT <= 0 && spawn()) spawnT = R.gap[0] + Math.random() * (R.gap[1] - R.gap[0]);
+  }
+
+  for (const p of people) {
+    p.t += dt;
+    if (p.state === 'rise') { p.up = Math.min(1, p.up + dt / 0.18); if (p.up >= 1) { p.state = 'up'; p.t = 0; } }
+    else if (p.state === 'up') {
+      if (p.kind === 'bandit' && p.t > p.stay) {
+        p.state = 'fire'; p.t = 0; combo = 1;
+        bang(0.35, 0.35, 900);
+        popups.push({ x: SPOTS[p.spot].x, y: bodyY(p) - 95, text: 'BANG!', color: '#ff5050', life: 0.8 });
+        loseLife();
+        if (state !== 'play') return;
+      } else if (p.kind !== 'bandit' && p.t > p.stay * 1.3) { p.state = 'hide'; p.t = 0; }
+    }
+    else if (p.state === 'fire') { if (p.t > 0.35) { p.state = 'hide'; p.t = 0; } }
+    else if (p.state === 'hide') p.up -= dt / 0.2;
+    else if (p.state === 'down') { p.up -= dt * 1.8; p.tilt += p.dir * dt * 4; }
+  }
+  people = people.filter(p => p.state === 'down' ? p.t < 0.6 : p.up > 0);
+
+  if (downed >= R.quota && !people.some(p => p.kind === 'bandit' && p.state !== 'down')) {
+    const acc = shots ? hits / shots : 0;
+    roundBonus = Math.round(acc * 500) + lives * 100;
+    score += roundBonus; saveBest();
+    state = round === ROUNDS.length - 1 ? 'won' : 'cleared';
+    [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => beep(f, 0.15, 'triangle'), i * 110));
+  }
+}
+
+// ---------- drawing: scene ----------
+function drawScene() {
+  const sunset = round === ROUNDS.length - 1;
+  const sky = ctx.createLinearGradient(0, 0, 0, STREET);
+  if (sunset) { sky.addColorStop(0, '#3b2a6b'); sky.addColorStop(0.5, '#e8664a'); sky.addColorStop(1, '#ffc46b'); }
+  else { sky.addColorStop(0, '#6fb7e8'); sky.addColorStop(1, '#f6dca2'); }
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, STREET);
+  // sun + mesas
+  ctx.fillStyle = sunset ? '#ffdd77' : '#fff6c8';
+  ctx.beginPath(); ctx.arc(sunset ? 450 : 780, sunset ? 300 : 90, 34, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = sunset ? '#7a3b46' : '#c98a5a';
+  ctx.beginPath(); ctx.moveTo(0, 330); ctx.lineTo(60, 260); ctx.lineTo(180, 260); ctx.lineTo(230, 330);
+  ctx.lineTo(620, 330); ctx.lineTo(670, 280); ctx.lineTo(820, 280); ctx.lineTo(870, 330); ctx.lineTo(W, 330); ctx.lineTo(W, STREET); ctx.lineTo(0, STREET); ctx.fill();
+
+  for (const b of BUILDINGS) {
+    ctx.fillStyle = b.color;
+    ctx.fillRect(b.x + 12, 52, b.w - 24, 30);           // false front
+    ctx.fillRect(b.x, 78, b.w, STREET - 78);
+    ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 1;
+    for (let y = 92; y < STREET; y += 14) { ctx.beginPath(); ctx.moveTo(b.x, y); ctx.lineTo(b.x + b.w, y); ctx.stroke(); }
+    // sign
+    ctx.fillStyle = '#f1e2c0'; ctx.fillRect(b.x + 70, 58, b.w - 140, 30);
+    ctx.strokeStyle = '#5a3a1a'; ctx.lineWidth = 3; ctx.strokeRect(b.x + 70, 58, b.w - 140, 30);
+    ctx.fillStyle = '#5a3a1a'; ctx.font = 'bold 20px Georgia, serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(b.name, b.x + b.w / 2, 74); ctx.textBaseline = 'alphabetic';
+    // porch roof + posts
+    ctx.fillStyle = '#5e3b1e'; ctx.fillRect(b.x - 4, 262, b.w + 8, 14);
+    ctx.fillStyle = '#6e4626'; ctx.fillRect(b.x + 6, 276, 8, STREET - 276); ctx.fillRect(b.x + b.w - 14, 276, 8, STREET - 276);
+    // door + lower windows
+    ctx.fillStyle = '#3a2412'; ctx.fillRect(b.x + b.w / 2 - 30, 330, 60, STREET - 330);
+    if (b.name === 'SALOON') {   // swinging doors
+      ctx.fillStyle = '#b07a45'; ctx.fillRect(b.x + b.w / 2 - 28, 350, 26, 50); ctx.fillRect(b.x + b.w / 2 + 2, 350, 26, 50);
+    }
+    for (const wx of [b.x + 34, b.x + b.w - 84]) {
+      ctx.fillStyle = '#2b3b45'; ctx.fillRect(wx, 320, 50, 60);
+      ctx.strokeStyle = '#e6d3a8'; ctx.lineWidth = 4; ctx.strokeRect(wx, 320, 50, 60);
+      ctx.beginPath(); ctx.moveTo(wx + 25, 320); ctx.lineTo(wx + 25, 380); ctx.stroke();
+    }
+  }
+  // dark window interiors (people get drawn on top of these)
+  for (const s of SPOTS) if (s.cover === 'window') {
+    ctx.fillStyle = '#24160b'; ctx.fillRect(s.x - s.clipW / 2, s.clipTop, s.clipW, s.base - s.clipTop);
+  }
+  for (const h of holes) {
+    ctx.globalAlpha = Math.min(1, h.life);
+    ctx.fillStyle = '#1b1008'; ctx.beginPath(); ctx.arc(h.x, h.y, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,240,200,0.5)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(h.x, h.y, 5, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawWindowFrame(s) {
+  const l = s.x - s.clipW / 2, w = s.clipW, h = s.base - s.clipTop;
+  ctx.strokeStyle = '#e6d3a8'; ctx.lineWidth = 6; ctx.strokeRect(l, s.clipTop, w, h);
+  ctx.fillStyle = '#5a3a1a'; ctx.fillRect(l - 14, s.clipTop - 2, 12, h + 4); ctx.fillRect(l + w + 2, s.clipTop - 2, 12, h + 4); // shutters
+  ctx.fillStyle = '#e6d3a8'; ctx.fillRect(l - 6, s.base - 2, w + 12, 9);  // sill
+}
+
+function drawStreet() {
+  const g = ctx.createLinearGradient(0, STREET, 0, H);
+  g.addColorStop(0, '#d9b77a'); g.addColorStop(1, '#b8915a');
+  ctx.fillStyle = g; ctx.fillRect(0, STREET, W, H - STREET);
+  ctx.strokeStyle = 'rgba(120,80,40,0.35)'; ctx.lineWidth = 2;
+  for (const y of [500, 530]) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y + 6); ctx.stroke(); }
+}
+
+function drawCover(s) {
+  const x = s.x, y = s.base - 10;
+  if (s.cover === 'barrel') {
+    ctx.fillStyle = '#8b5a2b'; ctx.beginPath(); ctx.ellipse(x, y + 38, 34, 44, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#6b4220'; ctx.fillRect(x - 36, y, 72, 6); ctx.fillRect(x - 36, y + 70, 72, 6);
+    ctx.fillStyle = '#555'; ctx.fillRect(x - 35, y + 18, 70, 5); ctx.fillRect(x - 35, y + 54, 70, 5);
+    ctx.fillStyle = '#7a4c22'; ctx.beginPath(); ctx.ellipse(x, y, 34, 7, 0, 0, Math.PI * 2); ctx.fill();
+  } else if (s.cover === 'trough') {
+    ctx.fillStyle = '#6e4626'; ctx.fillRect(x - 70, y, 140, 46);
+    ctx.fillStyle = '#4b9dc9'; ctx.fillRect(x - 64, y + 2, 128, 6);
+    ctx.fillStyle = '#5a3a1a'; ctx.fillRect(x - 66, y + 46, 10, 18); ctx.fillRect(x + 56, y + 46, 10, 18);
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 1;
+    for (let k = 1; k < 3; k++) { ctx.beginPath(); ctx.moveTo(x - 70, y + k * 15); ctx.lineTo(x + 70, y + k * 15); ctx.stroke(); }
+  } else {
+    ctx.fillStyle = '#b8874a'; ctx.fillRect(x - 46, y, 92, 68);
+    ctx.strokeStyle = '#7a5528'; ctx.lineWidth = 6; ctx.strokeRect(x - 43, y + 3, 86, 62);
+    ctx.beginPath(); ctx.moveTo(x - 43, y + 3); ctx.lineTo(x + 43, y + 65); ctx.stroke();
+  }
+}
+
+// ---------- drawing: people ----------
+function drawHat(kind) {
+  if (kind === 'bandit' || kind === 'deputy') {
+    ctx.fillStyle = kind === 'bandit' ? '#1a1a1a' : '#f2efe6';
+    ctx.beginPath(); ctx.ellipse(0, -60, 25, 5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-13, -60); ctx.lineTo(-11, -76); ctx.quadraticCurveTo(0, -80, 11, -76); ctx.lineTo(13, -60); ctx.fill();
+    ctx.fillStyle = kind === 'bandit' ? '#8b1a1a' : '#8b6b4a'; ctx.fillRect(-13, -64, 26, 4);
+  } else if (kind === 'farmer') {
+    ctx.fillStyle = '#e8c860';
+    ctx.beginPath(); ctx.ellipse(0, -60, 28, 6, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, -66, 13, 9, 0, Math.PI, 0); ctx.fill();
+  } else if (kind === 'lady') {
+    ctx.fillStyle = '#9ad0ec';
+    ctx.beginPath(); ctx.arc(0, -50, 18, Math.PI * 0.9, Math.PI * 2.1); ctx.fill();
+    ctx.fillStyle = '#ff8fb8'; ctx.beginPath(); ctx.arc(14, -40, 4, 0, Math.PI * 2); ctx.fill();
+  } else if (kind === 'kid') {
+    ctx.fillStyle = '#3a7bd5';
+    ctx.beginPath(); ctx.arc(0, -56, 13, Math.PI, 0); ctx.fill(); ctx.fillRect(0, -58, 20, 4);
+  } else if (kind === 'oldtimer') {
+    ctx.fillStyle = '#6b4a2a';
+    ctx.beginPath(); ctx.ellipse(0, -60, 19, 4, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, -62, 11, Math.PI, 0); ctx.fill();
+  }
+}
+
+function drawPerson(p) {
+  const s = SPOTS[p.spot], by = bodyY(p), k = p.kind;
+  const aiming = k === 'bandit' && (p.state === 'fire' || (p.state === 'up' && p.t > p.stay - 0.6));
+  ctx.save();
+  ctx.beginPath(); ctx.rect(s.x - s.clipW / 2, s.clipTop, s.clipW, s.base - s.clipTop); ctx.clip();
+  ctx.translate(s.x, by);
+  if (k === 'kid') ctx.scale(0.85, 0.85);
+  ctx.rotate(p.tilt);
+  // torso
+  const shirt = { bandit: '#3b3b46', deputy: '#6b8fb5', farmer: '#c0392b', lady: '#a66bbf', kid: '#e8a23a', oldtimer: '#7d7d7d' }[k];
+  ctx.fillStyle = shirt;
+  ctx.beginPath(); ctx.moveTo(-18, 0); ctx.lineTo(-18, -26); ctx.quadraticCurveTo(-18, -38, 0, -38); ctx.quadraticCurveTo(18, -38, 18, -26); ctx.lineTo(18, 0); ctx.fill();
+  if (k === 'bandit') { ctx.fillStyle = '#1e1e1e'; ctx.fillRect(-18, -34, 8, 34); ctx.fillRect(10, -34, 8, 34); }
+  if (k === 'deputy') {   // star badge
+    ctx.fillStyle = '#ffd23f'; ctx.beginPath();
+    for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? 3 : 7; ctx.lineTo(-8 + Math.cos(a) * r, -24 + Math.sin(a) * r); }
+    ctx.fill();
+  }
+  if (k === 'farmer') { ctx.fillStyle = '#3d5a99'; ctx.fillRect(-12, -36, 5, 36); ctx.fillRect(7, -36, 5, 36); ctx.fillRect(-12, -18, 24, 18); }
+  if (k === 'kid') { ctx.fillStyle = '#fff'; for (let y = -32; y < 0; y += 8) ctx.fillRect(-18, y, 36, 3); }
+  // head
+  ctx.fillStyle = '#f1c27d';
+  ctx.beginPath(); ctx.arc(0, -50, 13, 0, Math.PI * 2); ctx.fill();
+  // eyes
+  ctx.fillStyle = '#222';
+  ctx.beginPath(); ctx.arc(-5, -53, 1.8, 0, Math.PI * 2); ctx.arc(5, -53, 1.8, 0, Math.PI * 2); ctx.fill();
+  if (p.state === 'down') {   // dizzy X eyes
+    ctx.strokeStyle = '#222'; ctx.lineWidth = 1.5;
+    for (const ex of [-5, 5]) { ctx.beginPath(); ctx.moveTo(ex - 2.5, -55.5); ctx.lineTo(ex + 2.5, -50.5); ctx.moveTo(ex + 2.5, -55.5); ctx.lineTo(ex - 2.5, -50.5); ctx.stroke(); }
+  }
+  if (k === 'bandit') {
+    ctx.strokeStyle = '#222'; ctx.lineWidth = 2;   // angry brows
+    ctx.beginPath(); ctx.moveTo(-9, -59); ctx.lineTo(-2, -56); ctx.moveTo(9, -59); ctx.lineTo(2, -56); ctx.stroke();
+    ctx.fillStyle = '#c0392b';                      // bandana
+    ctx.beginPath(); ctx.moveTo(-13, -49); ctx.lineTo(13, -49); ctx.lineTo(10, -40); ctx.lineTo(0, -34); ctx.lineTo(-10, -40); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(-4, -43, 1.2, 0, Math.PI * 2); ctx.arc(5, -45, 1.2, 0, Math.PI * 2); ctx.fill();
+  } else if (k === 'oldtimer') {
+    ctx.fillStyle = '#f4f4f4';
+    ctx.beginPath(); ctx.moveTo(-11, -46); ctx.quadraticCurveTo(0, -24, 11, -46); ctx.fill();
+  } else {
+    ctx.strokeStyle = '#7a3b2a'; ctx.lineWidth = 1.5;   // smile
+    ctx.beginPath(); ctx.arc(0, -47, 5, 0.2, Math.PI - 0.2); ctx.stroke();
+    if (k === 'lady' || k === 'kid') {
+      ctx.fillStyle = 'rgba(255,120,120,0.5)'; ctx.beginPath(); ctx.arc(-8, -46, 2.5, 0, Math.PI * 2); ctx.arc(8, -46, 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  if (p.state !== 'down') drawHat(k);
+  // hands / props
+  if (k === 'bandit') {
+    if (aiming) {   // revolver pointed at you
+      ctx.fillStyle = '#f1c27d'; ctx.beginPath(); ctx.arc(12, -20, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#444'; ctx.beginPath(); ctx.arc(12, -20, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(12, -20, 3, 0, Math.PI * 2); ctx.fill();
+      if (p.state === 'fire' && p.t < 0.15) {
+        ctx.fillStyle = '#ffe36e'; ctx.beginPath();
+        for (let i = 0; i < 16; i++) { const a = i * Math.PI / 8, r = i % 2 ? 8 : 20; ctx.lineTo(12 + Math.cos(a) * r, -20 + Math.sin(a) * r); }
+        ctx.fill();
+      }
+    } else {        // revolver held up beside the head
+      ctx.fillStyle = '#444'; ctx.fillRect(19, -58, 5, 16); ctx.fillRect(17, -44, 9, 7);
+      ctx.fillStyle = '#f1c27d'; ctx.beginPath(); ctx.arc(21, -38, 5, 0, Math.PI * 2); ctx.fill();
+    }
+  } else if (k === 'kid') {   // lollipop
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(18, -14); ctx.lineTo(20, -40); ctx.stroke();
+    ctx.fillStyle = '#ff5ea8'; ctx.beginPath(); ctx.arc(20, -44, 7, 0, Math.PI * 2); ctx.fill();
+  } else if (k === 'lady') {   // flowers
+    ctx.fillStyle = '#3d8a28'; ctx.fillRect(-2, -18, 3, 14);
+    for (const [fx, fc] of [[-6, '#ffd23f'], [0, '#ff6fa8'], [6, '#fff']]) { ctx.fillStyle = fc; ctx.beginPath(); ctx.arc(fx, -21, 4, 0, Math.PI * 2); ctx.fill(); }
+  } else {                     // friendly wave
+    ctx.fillStyle = '#f1c27d'; ctx.beginPath(); ctx.arc(22, -44 + Math.sin(t * 10) * 3, 5, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+  if (aiming && p.state === 'up') {
+    ctx.fillStyle = Math.floor(t * 10) % 2 ? '#ff3030' : '#ffe36e';
+    ctx.font = 'bold 22px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText('!', s.x, Math.max(s.clipTop + 18, by - 84));
+  }
+}
+
+// ---------- drawing: overlays ----------
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+    if (p.hat) { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.translate(0, 62); drawHat(p.hat); ctx.restore(); }
+    else { ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center'; ctx.font = 'bold 20px system-ui';
+  for (const p of popups) {
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 4; ctx.strokeText(p.text, p.x, p.y);
+    ctx.fillStyle = p.color; ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  ctx.fillStyle = 'rgba(30,15,5,0.75)'; ctx.fillRect(0, 0, W, TOP);
+  ctx.textBaseline = 'middle'; ctx.font = 'bold 18px system-ui';
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+  ctx.fillText(`Round ${round + 1}: ${ROUNDS[round].name}`, 14, TOP / 2);
+  ctx.textAlign = 'center';
+  ctx.fillText(`🤠 ${Math.min(downed, ROUNDS[round].quota)} / ${ROUNDS[round].quota}`, W / 2 + 40, TOP / 2);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#ff5a5a'; ctx.fillText('♥'.repeat(lives) + '♡'.repeat(3 - lives), W - 230, TOP / 2);
+  ctx.fillStyle = '#fff'; ctx.fillText(`Score ${score}   Best ${best}`, W - 14, TOP / 2);
+  // ammo box
+  const b = AMMO_BOX;
+  ctx.fillStyle = 'rgba(30,15,5,0.75)'; ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.strokeStyle = ammo === 0 && Math.floor(t * 4) % 2 ? '#ffd23f' : '#8a6d4b'; ctx.lineWidth = 2; ctx.strokeRect(b.x, b.y, b.w, b.h);
+  if (reloading > 0) {
+    ctx.fillStyle = '#ffd23f'; ctx.fillRect(b.x + 8, b.y + b.h - 8, (b.w - 16) * (1 - reloading / RELOAD_TIME), 4);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 15px system-ui'; ctx.fillText('Reloading…', b.x + b.w / 2, b.y + 18);
+  } else {
+    for (let i = 0; i < MAX_AMMO; i++) {
+      const x = b.x + 14 + i * 18, full = i < ammo;
+      ctx.fillStyle = full ? '#d4a537' : 'rgba(255,255,255,0.15)';
+      ctx.beginPath(); ctx.roundRect(x, b.y + 9, 9, 24, [5, 5, 1, 1]); ctx.fill();
+      if (full) { ctx.fillStyle = '#a66a1a'; ctx.fillRect(x, b.y + 27, 9, 6); }
+    }
+    ctx.fillStyle = '#ccc'; ctx.font = '12px system-ui'; ctx.textAlign = 'right';
+    ctx.fillText('R', b.x + b.w - 10, b.y + b.h / 2);
+  }
+  if (combo > 1) {
+    ctx.fillStyle = '#ffe36e'; ctx.font = 'bold 18px system-ui'; ctx.textAlign = 'left';
+    ctx.fillText(`Combo x${combo}`, 14, H - 28);
+  }
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawCrosshair() {
+  if (!mouse.on || state !== 'play' || paused) { c.classList.remove('aim'); return; }
+  c.classList.add('aim');
+  const { x, y } = mouse;
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 4;
+  const lines = () => { ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2);
+    ctx.moveTo(x - 22, y); ctx.lineTo(x - 7, y); ctx.moveTo(x + 7, y); ctx.lineTo(x + 22, y);
+    ctx.moveTo(x, y - 22); ctx.lineTo(x, y - 7); ctx.moveTo(x, y + 7); ctx.lineTo(x, y + 22); ctx.stroke(); };
+  lines(); ctx.strokeStyle = '#ff3b3b'; ctx.lineWidth = 2; lines();
+}
+
+function panel(title, lines) {
+  ctx.fillStyle = 'rgba(0,0,0,0.62)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.fillStyle = '#ffcf6b'; ctx.font = 'bold 46px Georgia, serif';
+  ctx.fillText(title, W / 2, H / 2 - 60);
+  ctx.fillStyle = '#fff'; ctx.font = '20px system-ui';
+  lines.forEach((l, i) => ctx.fillText(l, W / 2, H / 2 - 10 + i * 30));
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * 14 * shake / 0.35, (Math.random() - 0.5) * 14 * shake / 0.35);
+  drawScene();
+  for (const p of people) if (SPOTS[p.spot].cover === 'window') drawPerson(p);
+  for (const s of SPOTS) if (s.cover === 'window') drawWindowFrame(s);
+  drawStreet();
+  for (const p of people) if (SPOTS[p.spot].cover !== 'window') drawPerson(p);
+  for (const s of SPOTS) if (s.cover !== 'window') drawCover(s);
+  drawParticles();
+  ctx.restore();
+  if (flash > 0) { ctx.fillStyle = `rgba(255,0,0,${flash})`; ctx.fillRect(0, 0, W, H); }
+  drawHUD();
+  const R = ROUNDS[round];
+  if (state === 'title') panel('🤠 Quick Draw', ['Bandits are robbing the town!', 'Shoot the masked bandits before they shoot you.', "Don't hit the townsfolk or the deputy.", '', 'Click, tap or press Space to start']);
+  else if (state === 'intro') panel(`Round ${round + 1}: ${R.name}`, [`Take down ${R.quota} bandits.`, `They draw in about ${R.stay.toFixed(1)} seconds: be quicker!`, 'Six shots, then reload (R / right-click / tap the bullets).', '', 'Click, tap or press Space to begin']);
+  else if (state === 'cleared') panel('Round clear!', [`Accuracy: ${shots ? Math.round(hits / shots * 100) : 0}%`, `Bonus: +${roundBonus} (accuracy + hearts left)`, `Score: ${score}`, '', 'Click, tap or press Space for the next round']);
+  else if (state === 'over') panel('Game Over', ['The bandits got away this time.', `Final score: ${score}   Best: ${best}`, '', 'Click, tap or press Space to play again']);
+  else if (state === 'won') panel('⭐ Town Saved! ⭐', ['You ran every bandit out of town.', `Final score: ${score}   Best: ${best}`, '', 'Click, tap or press Space to play again']);
+  else if (paused) panel('Paused', ['Press P to resume']);
+  drawCrosshair();
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+startRound(0); state = 'title';
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
