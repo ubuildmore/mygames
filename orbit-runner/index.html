@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orbit Runner</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+    font-family: system-ui, sans-serif; touch-action: none; user-select: none; -webkit-user-select: none; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  canvas { background: #000; max-width: 100vw; max-height: 75vh; border: 2px solid #333; }
+  p { color: #999; margin: 12px 16px; text-align: center; }
+  a { color: #8cf; }
+  #pad { display: none; gap: 12px; margin-top: 10px; }
+  #pad button { font-size: 22px; padding: 14px 22px; background: #222; color: #fff;
+    border: 2px solid #444; border-radius: 10px; touch-action: none; }
+  #pad button.on { border-color: #8cf; background: #234; }
+  @media (pointer: coarse) { #pad { display: flex; } }
+</style>
+</head>
+<body>
+<canvas id="c" width="900" height="600"></canvas>
+<div id="pad">
+  <button data-k="left">◀</button>
+  <button data-k="thrust">THRUST</button>
+  <button data-k="right">▶</button>
+</div>
+<p>← / → (or A / D) to rotate · ↑ / W to thrust · Space or tap to continue · R to restart level · P to pause<br>
+Fly around the planet, collect every crystal, then land gently back on the green pad (landing on it also refuels).<br>
+<a href="../">← all games</a></p>
+<script>
+const c = document.getElementById('c'), ctx = c.getContext('2d');
+const W = c.width, H = c.height, CX = W / 2, CY = H / 2, TAU = Math.PI * 2;
+const PR = 70;                  // planet radius
+const K = 9000;                 // planet gravity: g = K / r (≈130 px/s² at the surface).
+                                // 1/r instead of 1/r² keeps orbit speeds similar at every height.
+const MOON_GM = 60000;          // moon gravity: g = MOON_GM / d² (short range)
+const THRUST = 230, TURN = 3.2; // px/s², rad/s
+const FOOT = 10;                // ship centre to landing feet
+const HIT_R = 9;                // ship collision radius
+const SAFE_SPEED = 70, SAFE_TILT = 0.4;
+const PAD_ARC = 0.22, LOST_R = 900, STEP = 1 / 120;
+
+// Orbiting things are [radius, starting angle, angular speed in rad/s].
+const LEVELS = [
+  { name: 'First Orbit', fuel: 8, pad: -Math.PI / 2,
+    hint: 'Hold ↑ to lift off, then turn sideways and thrust to fall into orbit. The dotted line shows your path.',
+    crystals: [[140, 0, 0], [140, 2.1, 0], [140, 4.2, 0]], belts: [] },
+  { name: 'High and Low', fuel: 8, pad: -Math.PI / 2,
+    hint: 'Thrust forward to climb higher, backward to drop lower. Landing on the pad refuels you.',
+    crystals: [[115, 0.3, 0], [260, 2.6, 0], [190, 4.0, 0], [265, 5.9, 0]], belts: [] },
+  { name: 'Debris Ring', fuel: 9, pad: Math.PI,
+    hint: 'An asteroid belt circles the planet. Time your crossing through the gaps.',
+    crystals: [[125, 0.6, 0], [250, 0.2, 0], [250, 3.4, 0], [125, 4.4, 0]],
+    belts: [{ r: 180, n: 7, speed: 0.35 }] },
+  { name: 'Moonrise', fuel: 10, pad: -Math.PI / 2,
+    hint: 'The moon pulls you with its own gravity. Use it to swing around, but don\'t hit it.',
+    moon: [250, 0, 0.25, 24],
+    crystals: [[250, Math.PI, 0.25], [200, 0.3, 0.25], [150, 1.2, -0.4], [320, 2.9, 0], [320, 0.15, 0]],
+    belts: [] },
+  { name: 'Gauntlet', fuel: 11, pad: Math.PI / 2,
+    hint: 'Two belts spinning opposite ways, with crystals between them. Good luck, pilot.',
+    crystals: [[190, 0, 0.3], [190, Math.PI, 0.3], [285, 0.1, 0], [285, Math.PI + 0.1, 0], [110, -Math.PI / 2, -0.6]],
+    belts: [{ r: 150, n: 6, speed: 0.5 }, { r: 232, n: 8, speed: -0.35 }] },
+];
+
+const keys = {}, touch = {};
+let level = 0, score = 0, levelStartScore = 0, best = 0, paused = false;
+let L, t, ship, crystals, asteroids, moon, state, msg, banner, particles, lastBonus;
+
+try { best = +localStorage.getItem('orbitrunner-best') || 0; } catch (e) {}
+
+function rng(seed) { return () => (seed = (seed * 16807) % 2147483647) / 2147483647; }
+const r0 = rng(42);
+const stars = Array.from({ length: 160 }, () => ({ x: r0() * W, y: r0() * H, s: r0() * 1.5 + 0.3, p: r0() * TAU }));
+const craters = Array.from({ length: 9 }, () => ({ a: r0() * TAU, d: r0() * (PR - 18), r: 4 + r0() * 9 }));
+
+function orbit(o, time) {
+  const a = o.phase + o.speed * time;
+  return { x: CX + o.r * Math.cos(a), y: CY + o.r * Math.sin(a) };
+}
+function angDiff(a, b) { return Math.abs((((a - b + Math.PI) % TAU) + TAU) % TAU - Math.PI); }
+
+function buildLevel(i) {
+  L = LEVELS[i];
+  t = 0;
+  const r = rng(i * 7919 + 13);
+  crystals = L.crystals.map(([rad, phase, speed]) => ({ r: rad, phase, speed, taken: false }));
+  asteroids = [];
+  for (const b of L.belts) for (let k = 0; k < b.n; k++) {
+    const size = 9 + r() * 6;
+    asteroids.push({ r: b.r + (r() - 0.5) * 12, phase: k * TAU / b.n, speed: b.speed, size, spin: (r() - 0.5) * 2,
+      shape: Array.from({ length: 9 }, () => 0.7 + r() * 0.45) });
+  }
+  moon = L.moon ? { r: L.moon[0], phase: L.moon[1], speed: L.moon[2], R: L.moon[3] } : null;
+  const ux = Math.cos(L.pad), uy = Math.sin(L.pad);
+  ship = { x: CX + ux * (PR + FOOT), y: CY + uy * (PR + FOOT), vx: 0, vy: 0,
+    a: Math.atan2(ux, -uy), fuel: L.fuel, landed: true, onPad: true, thrusting: false };
+  particles = [];
+  levelStartScore = score;
+  state = 'play';
+  banner = 4;
+}
+
+function gravity(x, y, time) {
+  const dx = CX - x, dy = CY - y, d2 = dx * dx + dy * dy;
+  let gx = dx * K / d2, gy = dy * K / d2;
+  if (moon) {
+    const m = orbit(moon, time), mx = m.x - x, my = m.y - y, md2 = mx * mx + my * my, md = Math.sqrt(md2);
+    gx += mx * MOON_GM / (md2 * md); gy += my * MOON_GM / (md2 * md);
+  }
+  return [gx, gy];
+}
+
+// What (if anything) the ship would hit at this point and time.
+function hazard(x, y, time) {
+  const d = Math.hypot(x - CX, y - CY);
+  if (d < PR + FOOT) return 'planet';
+  if (d > LOST_R) return 'lost';
+  if (moon) { const m = orbit(moon, time); if (Math.hypot(x - m.x, y - m.y) < moon.R + HIT_R) return 'moon'; }
+  for (const a of asteroids) {
+    const p = orbit(a, time);
+    if (Math.hypot(x - p.x, y - p.y) < a.size + HIT_R - 2) return 'asteroid';
+  }
+  return null;
+}
+
+function crash(text) {
+  state = 'dead'; msg = text;
+  ship.thrusting = false;
+  for (let i = 0; i < 70; i++) {
+    const a = Math.random() * TAU, v = 30 + Math.random() * 160;
+    particles.push({ x: ship.x, y: ship.y, vx: ship.vx * 0.3 + Math.cos(a) * v, vy: ship.vy * 0.3 + Math.sin(a) * v,
+      life: 0.6 + Math.random() * 0.9, max: 1.5, col: Math.random() < 0.5 ? '#fa4' : '#f63' });
+  }
+}
+
+function burst(x, y, col) {
+  for (let i = 0; i < 24; i++) {
+    const a = Math.random() * TAU, v = 20 + Math.random() * 90;
+    particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.7, max: 0.7, col });
+  }
+}
+
+function step(dt) {
+  t += dt;
+  const s = ship;
+  const thrust = (keys.thrust || touch.thrust) && s.fuel > 0;
+  s.thrusting = thrust;
+
+  for (const cr of crystals) if (!cr.taken) {
+    const p = orbit(cr, t);
+    if (Math.hypot(s.x - p.x, s.y - p.y) < 18) { cr.taken = true; burst(p.x, p.y, '#6ef'); }
+  }
+
+  if (s.landed) {
+    if (!thrust) {
+      if (s.onPad) s.fuel = Math.min(L.fuel, s.fuel + 3 * dt);
+      return;
+    }
+    s.landed = false;
+  }
+
+  if (keys.left || touch.left) s.a -= TURN * dt;
+  if (keys.right || touch.right) s.a += TURN * dt;
+  let [ax, ay] = gravity(s.x, s.y, t);
+  if (thrust) {
+    ax += Math.sin(s.a) * THRUST; ay -= Math.cos(s.a) * THRUST;
+    s.fuel = Math.max(0, s.fuel - dt);
+  }
+  // Semi-implicit Euler keeps orbits stable.
+  s.vx += ax * dt; s.vy += ay * dt;
+  s.x += s.vx * dt; s.y += s.vy * dt;
+
+  const h = hazard(s.x, s.y, t);
+  if (h === 'planet') touchdown();
+  else if (h === 'lost') crash('Lost in deep space');
+  else if (h === 'moon') crash('You hit the moon');
+  else if (h === 'asteroid') crash('Smashed by an asteroid');
+}
+
+function touchdown() {
+  const s = ship, dx = s.x - CX, dy = s.y - CY, d = Math.hypot(dx, dy), ux = dx / d, uy = dy / d;
+  const speed = Math.hypot(s.vx, s.vy);
+  const tilt = Math.acos(Math.max(-1, Math.min(1, Math.sin(s.a) * ux - Math.cos(s.a) * uy)));
+  if (speed > SAFE_SPEED) return crash(`Too fast: ${speed.toFixed(0)} (land under ${SAFE_SPEED})`);
+  if (tilt > SAFE_TILT) return crash('Landed tilted. Point your nose away from the planet');
+  s.x = CX + ux * (PR + FOOT); s.y = CY + uy * (PR + FOOT);
+  s.vx = s.vy = 0; s.a = Math.atan2(ux, -uy); s.landed = true;
+  s.onPad = angDiff(Math.atan2(uy, ux), L.pad) < PAD_ARC;
+  if (s.onPad && crystals.every(cr => cr.taken)) complete();
+}
+
+function complete() {
+  lastBonus = { base: 500, fuel: Math.round(ship.fuel * 40), time: Math.max(0, Math.round((60 - t) * 10)) };
+  score += lastBonus.base + lastBonus.fuel + lastBonus.time;
+  if (score > best) { best = score; try { localStorage.setItem('orbitrunner-best', best); } catch (e) {} }
+  state = level === LEVELS.length - 1 ? 'won' : 'complete';
+  burst(ship.x, ship.y, '#6f8');
+}
+
+function advance() {
+  if (state === 'dead') { score = levelStartScore; buildLevel(level); }
+  else if (state === 'complete') buildLevel(++level);
+  else if (state === 'won') { level = 0; score = 0; buildLevel(0); }
+}
+
+// ---------- input ----------
+const KEYMAP = { ArrowLeft: 'left', a: 'left', A: 'left', ArrowRight: 'right', d: 'right', D: 'right',
+  ArrowUp: 'thrust', w: 'thrust', W: 'thrust' };
+addEventListener('keydown', e => {
+  if (KEYMAP[e.key]) { keys[KEYMAP[e.key]] = true; e.preventDefault(); }
+  if (e.key === ' ') { e.preventDefault(); if (state !== 'play') advance(); else paused = !paused; }
+  if (e.key === 'p' || e.key === 'P') { if (state === 'play') paused = !paused; }
+  if (e.key === 'r' || e.key === 'R') { paused = false; score = levelStartScore; buildLevel(level); }
+  if (e.key === 'ArrowDown') e.preventDefault();
+});
+addEventListener('keyup', e => { if (KEYMAP[e.key]) keys[KEYMAP[e.key]] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+c.addEventListener('pointerdown', () => { if (state !== 'play') advance(); else if (paused) paused = false; });
+for (const b of document.querySelectorAll('#pad button')) {
+  const k = b.dataset.k;
+  const on = e => { e.preventDefault(); touch[k] = true; b.classList.add('on'); if (state !== 'play') advance(); };
+  const off = e => { e.preventDefault(); touch[k] = false; b.classList.remove('on'); };
+  b.addEventListener('pointerdown', on);
+  b.addEventListener('pointerup', off);
+  b.addEventListener('pointercancel', off);
+  b.addEventListener('pointerleave', off);
+}
+
+// ---------- drawing ----------
+function drawBackground(now) {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  for (const s of stars) {
+    ctx.globalAlpha = 0.45 + 0.4 * Math.sin(now * 1.5 + s.p);
+    ctx.fillStyle = '#fff'; ctx.fillRect(s.x, s.y, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPlanet(now) {
+  const glow = ctx.createRadialGradient(CX, CY, PR, CX, CY, PR + 40);
+  glow.addColorStop(0, 'rgba(90,140,255,0.35)'); glow.addColorStop(1, 'rgba(90,140,255,0)');
+  ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(CX, CY, PR + 40, 0, TAU); ctx.fill();
+  const g = ctx.createRadialGradient(CX - 25, CY - 25, 10, CX, CY, PR);
+  g.addColorStop(0, '#7a6cc8'); g.addColorStop(1, '#2c2257');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(CX, CY, PR, 0, TAU); ctx.fill();
+  ctx.fillStyle = 'rgba(20,10,50,0.45)';
+  for (const k of craters) {
+    ctx.beginPath(); ctx.arc(CX + Math.cos(k.a) * k.d, CY + Math.sin(k.a) * k.d, k.r, 0, TAU); ctx.fill();
+  }
+  // landing pad
+  const ready = crystals.every(cr => cr.taken);
+  const pulse = ready ? 0.6 + 0.4 * Math.sin(now * 6) : 1;
+  ctx.strokeStyle = ready ? `rgba(110,255,140,${pulse})` : '#3c8';
+  ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(CX, CY, PR + 1, L.pad - PAD_ARC, L.pad + PAD_ARC); ctx.stroke();
+  for (const side of [-1, 1]) {
+    const a = L.pad + side * PAD_ARC;
+    ctx.fillStyle = Math.sin(now * 4) > 0 ? '#6f8' : '#264';
+    ctx.beginPath(); ctx.arc(CX + Math.cos(a) * (PR + 6), CY + Math.sin(a) * (PR + 6), 3, 0, TAU); ctx.fill();
+  }
+}
+
+function drawObjects(now) {
+  ctx.setLineDash([3, 7]); ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  for (const b of L.belts) { ctx.beginPath(); ctx.arc(CX, CY, b.r, 0, TAU); ctx.stroke(); }
+  if (moon) { ctx.beginPath(); ctx.arc(CX, CY, moon.r, 0, TAU); ctx.stroke(); }
+  ctx.setLineDash([]);
+
+  if (moon) {
+    const m = orbit(moon, t);
+    const g = ctx.createRadialGradient(m.x - 8, m.y - 8, 3, m.x, m.y, moon.R);
+    g.addColorStop(0, '#ccc'); g.addColorStop(1, '#555');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(m.x, m.y, moon.R, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath(); ctx.arc(m.x + 6, m.y + 4, 5, 0, TAU); ctx.arc(m.x - 7, m.y + 8, 3, 0, TAU); ctx.fill();
+  }
+
+  for (const a of asteroids) {
+    const p = orbit(a, t);
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(t * a.spin);
+    ctx.fillStyle = '#8a7360'; ctx.strokeStyle = '#b39a82'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    a.shape.forEach((k, i) => {
+      const ang = i / a.shape.length * TAU;
+      ctx.lineTo(Math.cos(ang) * a.size * k, Math.sin(ang) * a.size * k);
+    });
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const cr of crystals) if (!cr.taken) {
+    const p = orbit(cr, t), s = 8 + Math.sin(now * 4 + cr.phase) * 1.5;
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(now * 1.2);
+    ctx.shadowColor = '#6ef'; ctx.shadowBlur = 14;
+    ctx.fillStyle = '#9ff';
+    ctx.beginPath(); ctx.moveTo(0, -s); ctx.lineTo(s * 0.65, 0); ctx.lineTo(0, s); ctx.lineTo(-s * 0.65, 0); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// Dotted preview of where the ship will coast over the next few seconds.
+function drawPrediction() {
+  const s = ship;
+  if (s.landed || state !== 'play') return;
+  let x = s.x, y = s.y, vx = s.vx, vy = s.vy, time = t, hit = null;
+  const dt = 1 / 60;
+  for (let i = 1; i <= 270; i++) {
+    const [ax, ay] = gravity(x, y, time);
+    vx += ax * dt; vy += ay * dt; x += vx * dt; y += vy * dt; time += dt;
+    hit = hazard(x, y, time);
+    if (hit) break;
+    if (i % 5 === 0) {
+      ctx.fillStyle = `rgba(140,200,255,${0.7 * (1 - i / 270)})`;
+      ctx.fillRect(x - 1, y - 1, 2, 2);
+    }
+  }
+  if (hit && hit !== 'lost') {
+    const speed = Math.hypot(vx, vy);
+    const safe = hit === 'planet' && speed < SAFE_SPEED;
+    ctx.strokeStyle = safe ? '#6f8' : '#f55'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x - 5, y - 5); ctx.lineTo(x + 5, y + 5); ctx.moveTo(x + 5, y - 5); ctx.lineTo(x - 5, y + 5); ctx.stroke();
+  }
+}
+
+function drawShip() {
+  const s = ship;
+  if (state === 'dead') return;
+  ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(s.a);
+  if (s.thrusting && !paused) {
+    const len = 10 + Math.random() * 10;
+    ctx.fillStyle = '#fa4';
+    ctx.beginPath(); ctx.moveTo(-5, 7); ctx.lineTo(5, 7); ctx.lineTo(0, 7 + len); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#ff8';
+    ctx.beginPath(); ctx.moveTo(-2.5, 7); ctx.lineTo(2.5, 7); ctx.lineTo(0, 7 + len * 0.5); ctx.closePath(); ctx.fill();
+  }
+  ctx.strokeStyle = '#99a'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-5, 5); ctx.lineTo(-9, FOOT); ctx.moveTo(5, 5); ctx.lineTo(9, FOOT); ctx.stroke();
+  ctx.fillStyle = '#e8e8f0';
+  ctx.beginPath(); ctx.moveTo(0, -15); ctx.lineTo(6, -2); ctx.lineTo(6, 7); ctx.lineTo(-6, 7); ctx.lineTo(-6, -2); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#e44';
+  ctx.beginPath(); ctx.moveTo(0, -15); ctx.lineTo(4, -6); ctx.lineTo(-4, -6); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#6cf'; ctx.beginPath(); ctx.arc(0, 0, 2.5, 0, TAU); ctx.fill();
+  ctx.restore();
+
+  // arrow at the screen edge when the ship is out of view
+  if (s.x < 0 || s.x > W || s.y < 0 || s.y > H) {
+    const ex = Math.max(16, Math.min(W - 16, s.x)), ey = Math.max(16, Math.min(H - 16, s.y));
+    const ang = Math.atan2(s.y - ey, s.x - ex);
+    ctx.save(); ctx.translate(ex, ey); ctx.rotate(ang);
+    ctx.fillStyle = '#fc4'; ctx.beginPath(); ctx.moveTo(10, 0); ctx.lineTo(-6, -7); ctx.lineTo(-6, 7); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawParticles(dt) {
+  for (const p of particles) {
+    p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.col; ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+  particles = particles.filter(p => p.life > 0);
+}
+
+function drawHUD() {
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.font = 'bold 16px system-ui, sans-serif'; ctx.fillStyle = '#ddd';
+  ctx.fillText(`Level ${level + 1}/${LEVELS.length} · ${L.name}`, 14, 12);
+  const got = crystals.filter(cr => cr.taken).length;
+  ctx.font = '14px system-ui, sans-serif';
+  ctx.fillStyle = '#9ff'; ctx.fillText(`◆ ${got}/${crystals.length}`, 14, 36);
+  ctx.fillStyle = '#aaa'; ctx.fillText('Fuel', 14, 58);
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 1; ctx.strokeRect(52, 59, 120, 12);
+  const f = ship.fuel / L.fuel;
+  ctx.fillStyle = f > 0.3 ? '#fc4' : '#f55'; ctx.fillRect(53, 60, 118 * f, 10);
+  const speed = Math.hypot(ship.vx, ship.vy);
+  ctx.fillStyle = speed < SAFE_SPEED ? '#6f8' : '#aaa';
+  ctx.fillText(`Speed ${speed.toFixed(0)}`, 14, 80);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#ddd';
+  ctx.fillText(`Score ${score}`, W - 14, 12);
+  ctx.fillStyle = '#888'; ctx.fillText(`Best ${best}`, W - 14, 32);
+
+  ctx.textAlign = 'center';
+  if (state === 'play' && got === crystals.length && !ship.landed) {
+    ctx.fillStyle = '#6f8'; ctx.font = 'bold 16px system-ui, sans-serif';
+    ctx.fillText('All crystals collected! Land on the green pad', CX, H - 34);
+  } else if (state === 'play' && ship.landed && ship.onPad && ship.fuel < L.fuel - 0.01) {
+    ctx.fillStyle = '#fc4'; ctx.fillText('Refueling…', CX, H - 34);
+  } else if (state === 'play' && ship.fuel <= 0) {
+    ctx.fillStyle = '#f55'; ctx.fillText('Out of fuel. Press R to retry', CX, H - 34);
+  }
+}
+
+function overlay(title, lines, col) {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, CY - 90, W, 180);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = col; ctx.font = 'bold 36px system-ui, sans-serif'; ctx.fillText(title, CX, CY - 45);
+  ctx.fillStyle = '#ddd'; ctx.font = '17px system-ui, sans-serif';
+  lines.forEach((l, i) => ctx.fillText(l, CX, CY + 2 + i * 26));
+}
+
+function drawBanner(dt) {
+  if (banner <= 0 || state !== 'play') return;
+  banner -= dt;
+  ctx.globalAlpha = Math.min(1, banner);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 28px system-ui, sans-serif';
+  ctx.fillText(L.name, CX, 120);
+  ctx.fillStyle = '#bbb'; ctx.font = '15px system-ui, sans-serif';
+  ctx.fillText(L.hint, CX, 150);
+  ctx.globalAlpha = 1;
+}
+
+// ---------- loop ----------
+let last = performance.now(), acc = 0;
+function frame(ms) {
+  const dt = Math.min(0.05, (ms - last) / 1000); last = ms;
+  const now = ms / 1000;
+  if (state === 'play' && !paused) {
+    acc += dt;
+    while (acc >= STEP && state === 'play') { step(STEP); acc -= STEP; }
+    if (ship.thrusting && state === 'play') {
+      for (let i = 0; i < 2; i++) {
+        const sp = 80 + Math.random() * 60, a = ship.a + (Math.random() - 0.5) * 0.5;
+        particles.push({ x: ship.x - Math.sin(ship.a) * 12, y: ship.y + Math.cos(ship.a) * 12,
+          vx: ship.vx - Math.sin(a) * sp, vy: ship.vy + Math.cos(a) * sp, life: 0.35, max: 0.35, col: '#fa4' });
+      }
+    }
+  } else acc = 0;
+
+  drawBackground(now);
+  drawPlanet(now);
+  drawObjects(now);
+  drawPrediction();
+  drawParticles(paused ? 0 : dt);
+  drawShip();
+  drawHUD();
+  drawBanner(paused ? 0 : dt);
+
+  if (paused && state === 'play') overlay('Paused', ['Press P, Space or tap to resume'], '#fff');
+  if (state === 'dead') overlay('Crashed', [msg, 'Space or tap to retry'], '#f66');
+  if (state === 'complete') overlay('Mission complete!',
+    [`+${lastBonus.base} landing · +${lastBonus.fuel} fuel · +${lastBonus.time} time`, 'Space or tap for the next level'], '#6f8');
+  if (state === 'won') overlay('You conquered every orbit!',
+    [`Final score ${score}${score >= best ? ' · new best!' : ''}`, 'Space or tap to play again'], '#fc4');
+  requestAnimationFrame(frame);
+}
+
+buildLevel(0);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
